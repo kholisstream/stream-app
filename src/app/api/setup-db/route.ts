@@ -115,7 +115,6 @@ CREATE INDEX IF NOT EXISTS idx_notifications_created_at ON public.notifications(
 -- ROW LEVEL SECURITY
 -- ==========================================
 
--- Profiles
 ALTER TABLE public.profiles ENABLE ROW LEVEL SECURITY;
 DO $$ BEGIN
   CREATE POLICY "Profiles are viewable by everyone" ON public.profiles FOR SELECT USING (true);
@@ -130,7 +129,6 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Posts
 ALTER TABLE public.posts ENABLE ROW LEVEL SECURITY;
 DO $$ BEGIN
   CREATE POLICY "Posts are viewable by everyone" ON public.posts FOR SELECT USING (true);
@@ -149,7 +147,6 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Likes
 ALTER TABLE public.likes ENABLE ROW LEVEL SECURITY;
 DO $$ BEGIN
   CREATE POLICY "Likes are viewable by everyone" ON public.likes FOR SELECT USING (true);
@@ -164,7 +161,6 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Reposts
 ALTER TABLE public.reposts ENABLE ROW LEVEL SECURITY;
 DO $$ BEGIN
   CREATE POLICY "Reposts are viewable by everyone" ON public.reposts FOR SELECT USING (true);
@@ -179,7 +175,6 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Follows
 ALTER TABLE public.follows ENABLE ROW LEVEL SECURITY;
 DO $$ BEGIN
   CREATE POLICY "Follows are viewable by everyone" ON public.follows FOR SELECT USING (true);
@@ -194,7 +189,6 @@ DO $$ BEGIN
 EXCEPTION WHEN duplicate_object THEN NULL;
 END $$;
 
--- Notifications
 ALTER TABLE public.notifications ENABLE ROW LEVEL SECURITY;
 DO $$ BEGIN
   CREATE POLICY "Users can read own notifications" ON public.notifications FOR SELECT USING (auth.uid() = user_id);
@@ -286,24 +280,71 @@ LEFT JOIN public.posts r ON r.parent_id = p.id
 GROUP BY p.id;
 `;
 
+async function tryConnect(connectionUrl: string): Promise<Client | null> {
+  const client = new Client({
+    connectionString: connectionUrl,
+    ssl: { rejectUnauthorized: false },
+    connectionTimeoutMillis: 10000,
+  });
+  try {
+    await client.connect();
+    await client.query('SELECT 1');
+    return client;
+  } catch {
+    try { await client.end(); } catch { /* ignore */ }
+    return null;
+  }
+}
+
 export async function GET() {
   const databaseUrl = process.env.DATABASE_URL;
-  
-  if (!databaseUrl) {
+  const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
+  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+  // Try the DATABASE_URL first
+  let client: Client | null = null;
+  let usedUrl = '';
+
+  if (databaseUrl) {
+    client = await tryConnect(databaseUrl);
+    if (client) usedUrl = databaseUrl;
+  }
+
+  // If DATABASE_URL doesn't work, try pooler connections with different regions
+  if (!client && supabaseUrl) {
+    const projectRef = supabaseUrl.replace('https://', '').replace('.supabase.co', '');
+    const dbPassword = process.env.SUPABASE_DB_PASSWORD || '';
+    const encodedPassword = encodeURIComponent(dbPassword);
+
+    const regions = [
+      'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
+      'eu-west-1', 'eu-west-2', 'eu-central-1', 'eu-central-2',
+      'ap-southeast-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-south-1',
+      'ca-central-1', 'sa-east-1',
+    ];
+
+    for (const region of regions) {
+      const poolerUrl = `postgresql://postgres.${projectRef}:${encodedPassword}@aws-0-${region}.pooler.supabase.com:6543/postgres`;
+      client = await tryConnect(poolerUrl);
+      if (client) {
+        usedUrl = poolerUrl;
+        break;
+      }
+    }
+  }
+
+  if (!client) {
     return NextResponse.json(
-      { error: 'DATABASE_URL environment variable is not set' },
+      { 
+        error: 'Could not connect to database', 
+        hint: 'Please set DATABASE_URL or SUPABASE_DB_PASSWORD environment variable with the correct connection string',
+        tried: databaseUrl ? 'DATABASE_URL did not work' : 'No DATABASE_URL set',
+      },
       { status: 500 }
     );
   }
 
-  const client = new Client({
-    connectionString: databaseUrl,
-    ssl: { rejectUnauthorized: false },
-  });
-
   try {
-    await client.connect();
-    
     // Run schema
     await client.query(schemaSQL);
     
@@ -320,6 +361,7 @@ export async function GET() {
       success: true,
       message: 'Database schema applied successfully!',
       tables: rows.map((r: { table_name: string }) => r.table_name),
+      connectionUsed: usedUrl.replace(/:([^:@]+)@/, ':****@'),
     });
   } catch (error: unknown) {
     let message = 'Unknown error';
@@ -327,11 +369,7 @@ export async function GET() {
       message = error.message;
     }
     
-    try {
-      await client.end();
-    } catch {
-      // ignore
-    }
+    try { await client.end(); } catch { /* ignore */ }
     
     return NextResponse.json(
       { error: 'Failed to apply database schema', details: message },

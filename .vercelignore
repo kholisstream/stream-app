@@ -1,0 +1,10 @@
+node_modules
+.next
+.git
+db/*.db
+mini-services
+examples
+skills
+/supabase
+scripts
+*.log
