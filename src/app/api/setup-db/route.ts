@@ -280,19 +280,20 @@ LEFT JOIN public.posts r ON r.parent_id = p.id
 GROUP BY p.id;
 `;
 
-async function tryConnect(connectionUrl: string): Promise<Client | null> {
+async function tryConnect(connectionUrl: string): Promise<{ client: Client | null; error: string }> {
   const client = new Client({
     connectionString: connectionUrl,
     ssl: { rejectUnauthorized: false },
-    connectionTimeoutMillis: 10000,
+    connectionTimeoutMillis: 15000,
   });
   try {
     await client.connect();
     await client.query('SELECT 1');
-    return client;
-  } catch {
+    return { client, error: '' };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
     try { await client.end(); } catch { /* ignore */ }
-    return null;
+    return { client: null, error: msg };
   }
 }
 
@@ -300,20 +301,39 @@ export async function GET() {
   const databaseUrl = process.env.DATABASE_URL;
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
   const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+  const dbPassword = process.env.SUPABASE_DB_PASSWORD || '';
 
-  // Try the DATABASE_URL first
+  const errors: string[] = [];
   let client: Client | null = null;
   let usedUrl = '';
 
+  // Try DATABASE_URL first
   if (databaseUrl) {
-    client = await tryConnect(databaseUrl);
-    if (client) usedUrl = databaseUrl;
+    const result = await tryConnect(databaseUrl);
+    if (result.client) {
+      client = result.client;
+      usedUrl = databaseUrl;
+    } else {
+      errors.push(`DATABASE_URL: ${result.error}`);
+    }
   }
 
-  // If DATABASE_URL doesn't work, try pooler connections with different regions
+  // Try direct connection
   if (!client && supabaseUrl) {
     const projectRef = supabaseUrl.replace('https://', '').replace('.supabase.co', '');
-    const dbPassword = process.env.SUPABASE_DB_PASSWORD || '';
+    const directUrl = `postgresql://postgres:${encodeURIComponent(dbPassword)}@db.${projectRef}.supabase.co:5432/postgres`;
+    const result = await tryConnect(directUrl);
+    if (result.client) {
+      client = result.client;
+      usedUrl = directUrl;
+    } else {
+      errors.push(`Direct: ${result.error}`);
+    }
+  }
+
+  // Try pooler connections with different regions
+  if (!client && supabaseUrl && dbPassword) {
+    const projectRef = supabaseUrl.replace('https://', '').replace('.supabase.co', '');
     const encodedPassword = encodeURIComponent(dbPassword);
 
     const regions = [
@@ -324,12 +344,25 @@ export async function GET() {
     ];
 
     for (const region of regions) {
-      const poolerUrl = `postgresql://postgres.${projectRef}:${encodedPassword}@aws-0-${region}.pooler.supabase.com:6543/postgres`;
-      client = await tryConnect(poolerUrl);
-      if (client) {
-        usedUrl = poolerUrl;
+      // Session mode (port 5432)
+      const sessionUrl = `postgresql://postgres.${projectRef}:${encodedPassword}@aws-0-${region}.pooler.supabase.com:5432/postgres`;
+      const sessionResult = await tryConnect(sessionUrl);
+      if (sessionResult.client) {
+        client = sessionResult.client;
+        usedUrl = sessionUrl;
         break;
       }
+      
+      // Transaction mode (port 6543)
+      const txnUrl = `postgresql://postgres.${projectRef}:${encodedPassword}@aws-0-${region}.pooler.supabase.com:6543/postgres`;
+      const txnResult = await tryConnect(txnUrl);
+      if (txnResult.client) {
+        client = txnResult.client;
+        usedUrl = txnUrl;
+        break;
+      }
+      
+      errors.push(`${region}: session=${sessionResult.error?.substring(0, 60)} txn=${txnResult.error?.substring(0, 60)}`);
     }
   }
 
@@ -337,18 +370,19 @@ export async function GET() {
     return NextResponse.json(
       { 
         error: 'Could not connect to database', 
-        hint: 'Please set DATABASE_URL or SUPABASE_DB_PASSWORD environment variable with the correct connection string',
-        tried: databaseUrl ? 'DATABASE_URL did not work' : 'No DATABASE_URL set',
+        details: errors,
+        hasUrl: !!databaseUrl,
+        hasPassword: !!dbPassword,
+        hasSupabaseUrl: !!supabaseUrl,
+        hasServiceKey: !!supabaseServiceKey,
       },
       { status: 500 }
     );
   }
 
   try {
-    // Run schema
     await client.query(schemaSQL);
     
-    // Verify tables exist
     const { rows } = await client.query(`
       SELECT table_name FROM information_schema.tables 
       WHERE table_schema = 'public' 
