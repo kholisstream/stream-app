@@ -280,7 +280,37 @@ LEFT JOIN public.posts r ON r.parent_id = p.id
 GROUP BY p.id;
 `;
 
-async function tryConnect(connectionUrl: string): Promise<{ client: Client | null; error: string }> {
+// Use Supabase Management API to execute SQL
+async function executeSqlViaManagementApi(
+  projectRef: string,
+  sql: string,
+  accessToken: string
+): Promise<{ success: boolean; error?: string; data?: unknown }> {
+  try {
+    const response = await fetch(
+      `https://api.supabase.com/v1/projects/${projectRef}/database/query`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ query: sql }),
+      }
+    );
+    const data = await response.json();
+    if (!response.ok) {
+      return { success: false, error: JSON.stringify(data) };
+    }
+    return { success: true, data };
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : 'Unknown error';
+    return { success: false, error: msg };
+  }
+}
+
+// Try to split SQL into individual statements and execute via REST API using Supabase JS
+async function tryPgConnect(connectionUrl: string): Promise<{ client: Client | null; error: string }> {
   const client = new Client({
     connectionString: connectionUrl,
     ssl: { rejectUnauthorized: false },
@@ -300,69 +330,89 @@ async function tryConnect(connectionUrl: string): Promise<{ client: Client | nul
 export async function GET() {
   const databaseUrl = process.env.DATABASE_URL;
   const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL;
-  const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
   const dbPassword = process.env.SUPABASE_DB_PASSWORD || '';
+  const supabaseAccessToken = process.env.SUPABASE_ACCESS_TOKEN || '';
 
   const errors: string[] = [];
   let client: Client | null = null;
-  let usedUrl = '';
+  let usedMethod = '';
 
-  // Try DATABASE_URL first
+  // Method 1: Try DATABASE_URL
   if (databaseUrl) {
-    const result = await tryConnect(databaseUrl);
+    const result = await tryPgConnect(databaseUrl);
     if (result.client) {
       client = result.client;
-      usedUrl = databaseUrl;
+      usedMethod = 'DATABASE_URL';
     } else {
       errors.push(`DATABASE_URL: ${result.error}`);
     }
   }
 
-  // Try direct connection
+  // Method 2: Try direct connection
   if (!client && supabaseUrl) {
     const projectRef = supabaseUrl.replace('https://', '').replace('.supabase.co', '');
     const directUrl = `postgresql://postgres:${encodeURIComponent(dbPassword)}@db.${projectRef}.supabase.co:5432/postgres`;
-    const result = await tryConnect(directUrl);
+    const result = await tryPgConnect(directUrl);
     if (result.client) {
       client = result.client;
-      usedUrl = directUrl;
+      usedMethod = 'direct';
     } else {
       errors.push(`Direct: ${result.error}`);
     }
   }
 
-  // Try pooler connections with different regions
+  // Method 3: Try pooler connections (both new and legacy formats)
   if (!client && supabaseUrl && dbPassword) {
     const projectRef = supabaseUrl.replace('https://', '').replace('.supabase.co', '');
     const encodedPassword = encodeURIComponent(dbPassword);
 
     const regions = [
       'us-east-1', 'us-east-2', 'us-west-1', 'us-west-2',
-      'eu-west-1', 'eu-west-2', 'eu-central-1', 'eu-central-2',
-      'ap-southeast-1', 'ap-northeast-1', 'ap-northeast-2', 'ap-south-1',
-      'ca-central-1', 'sa-east-1',
+      'eu-west-1', 'eu-west-2', 'eu-central-1',
+      'ap-southeast-1', 'ap-northeast-1', 'ap-south-1',
     ];
 
     for (const region of regions) {
-      // Session mode (port 5432)
-      const sessionUrl = `postgresql://postgres.${projectRef}:${encodedPassword}@aws-0-${region}.pooler.supabase.com:5432/postgres`;
-      const sessionResult = await tryConnect(sessionUrl);
-      if (sessionResult.client) {
-        client = sessionResult.client;
-        usedUrl = sessionUrl;
-        break;
+      // New format with project-ref in username
+      for (const port of [5432, 6543]) {
+        const newUrl = `postgresql://postgres.${projectRef}:${encodedPassword}@aws-0-${region}.pooler.supabase.com:${port}/postgres`;
+        const newResult = await tryPgConnect(newUrl);
+        if (newResult.client) {
+          client = newResult.client;
+          usedMethod = `pooler-new-${region}-${port}`;
+          break;
+        }
       }
-      
-      // Transaction mode (port 6543)
-      const txnUrl = `postgresql://postgres.${projectRef}:${encodedPassword}@aws-0-${region}.pooler.supabase.com:6543/postgres`;
-      const txnResult = await tryConnect(txnUrl);
-      if (txnResult.client) {
-        client = txnResult.client;
-        usedUrl = txnUrl;
-        break;
+      if (client) break;
+
+      // Legacy format without project-ref in username
+      for (const port of [5432, 6543]) {
+        const legacyUrl = `postgresql://postgres:${encodedPassword}@${region}.pooler.supabase.com:${port}/postgres`;
+        const legacyResult = await tryPgConnect(legacyUrl);
+        if (legacyResult.client) {
+          client = legacyResult.client;
+          usedMethod = `pooler-legacy-${region}-${port}`;
+          break;
+        }
       }
-      
-      errors.push(`${region}: session=${sessionResult.error?.substring(0, 60)} txn=${txnResult.error?.substring(0, 60)}`);
+      if (client) break;
+
+      errors.push(`${region}: tried all formats`);
+    }
+  }
+
+  // Method 4: Try Supabase Management API with access token
+  if (!client && supabaseUrl && supabaseAccessToken) {
+    const projectRef = supabaseUrl.replace('https://', '').replace('.supabase.co', '');
+    const result = await executeSqlViaManagementApi(projectRef, schemaSQL, supabaseAccessToken);
+    if (result.success) {
+      return NextResponse.json({
+        success: true,
+        message: 'Database schema applied successfully via Management API!',
+        method: 'management-api',
+      });
+    } else {
+      errors.push(`Management API: ${result.error}`);
     }
   }
 
@@ -371,10 +421,10 @@ export async function GET() {
       { 
         error: 'Could not connect to database', 
         details: errors,
+        hint: 'Please provide either DATABASE_URL, SUPABASE_DB_PASSWORD (for pooler connection), or SUPABASE_ACCESS_TOKEN (for Management API). You can find the correct connection string in your Supabase Dashboard > Settings > Database.',
         hasUrl: !!databaseUrl,
         hasPassword: !!dbPassword,
-        hasSupabaseUrl: !!supabaseUrl,
-        hasServiceKey: !!supabaseServiceKey,
+        hasAccessToken: !!supabaseAccessToken,
       },
       { status: 500 }
     );
@@ -395,7 +445,7 @@ export async function GET() {
       success: true,
       message: 'Database schema applied successfully!',
       tables: rows.map((r: { table_name: string }) => r.table_name),
-      connectionUsed: usedUrl.replace(/:([^:@]+)@/, ':****@'),
+      method: usedMethod,
     });
   } catch (error: unknown) {
     let message = 'Unknown error';
